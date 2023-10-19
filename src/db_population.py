@@ -90,7 +90,7 @@ def get_date_published(date_str: str) -> Optional[datetime]:
     if date_str in {'unknown', '0'} or date_str.startswith('-'):
         return None
 
-    date_formats = ['%b %d, %Y', '%b %Y', '%Y', '%y']
+    date_formats = {'%b %d, %Y', '%b %Y', '%Y', '%y'}
     for format_str in date_formats:
         with suppress(ValueError):
             return datetime.strptime(date_str, format_str)
@@ -210,7 +210,7 @@ def merge_records_to_db(batch_inserts: set[Record], engine: Engine):
     pbar = tqdm(total=len(batch_inserts), position=1, leave=False)
     session = sessionmaker(bind=engine)()
     with session, pbar:
-        for model_cls in [User, Author, Book, Rating]:
+        for model_cls in {User, Author, Book, Rating}:
             for record in filter(lambda r: isinstance(r, model_cls), batch_inserts):
                 session.merge(record)
                 pbar.update(1)

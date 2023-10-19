@@ -3,171 +3,184 @@ import asyncio
 import os
 import re
 import subprocess
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import batched
+from os.path import abspath, dirname, join
 from typing import Optional, Union
 
 import aiofiles
+import aiofiles.os
 import pandas as pd
 from bs4 import BeautifulSoup
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import sessionmaker
 from tqdm import tqdm
 
-from src.models import Author, Base, Book, File, Rating, User
+from src.models import Author, Book, Rating, User
 
-Record = Union[Author, Book, File, Rating, User]
+Record = Union[Author, Book, Rating, User]
 
-DB_FILE = r'C:\Home\Work\graduate-work\book-scraper\goodreads.db'
-RATINGS = {'it was amazing': 5,
-           'really liked it': 4,
-           'liked it': 3,
-           'it was ok': 2,
-           'did not like it': 1}
+RATINGS = {
+    'it was amazing': 5,
+    'really liked it': 4,
+    'liked it': 3,
+    'it was ok': 2,
+    'did not like it': 1
+}
 
 
-parser = argparse.ArgumentParser(description='Goodreads HTML Scraper')
-parser.add_argument('--folder', type=str, help='Folder to save HTML files', required=True)
-parser.add_argument('--user_id_start', type=int, help='From User ID')
-parser.add_argument('--user_id_end', type=int, help='To User ID')
+@dataclass(frozen=True)
+class BookInfo:
+    id: int
+    cover_url: str
+    title: str
+    book_url: str
+    author: str
+    author_id: int
+    author_url: str
+    isbn: str
+    isbn13: str
+    pages_count: Optional[int]
+    avg_rating: float
+    ratings_count: int
+    date_published: Optional[datetime]
+    user_rating: int
 
-args = parser.parse_args()
-HTML_DIR: str = args.folder
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Goodreads HTML Scraper')
+    parser.add_argument('--folder', type=str,
+                        help='Folder to save HTML files',
+                        required=True, default=r'C:\Home\html')
+    parser.add_argument('--chunk_size', type=int,
+                        help='Chunk size', default=2048)
+    return parser.parse_args()
+
+
+def get_user_id_from_path(file_path: str) -> int:
+    user_id_pattern = re.compile(r'user_(\d+).*.html')
+    match = user_id_pattern.search(file_path)
+    if match:
+        return int(match.group(1))
+    raise ValueError(f'Invalid file path format: {file_path}')
 
 
 async def read_html_file(file_path: str) -> tuple[int, str]:
-    user_id = int(re.search(r'user_(\d+).*.html', file_path).group(1))
+    user_id = get_user_id_from_path(file_path)
     async with aiofiles.open(file_path, mode='r', encoding='utf-8') as html:
         file_contents = await html.read()
     return user_id, file_contents
 
 
-def get_user(user_id: int, soup: BeautifulSoup) -> Optional[User]:
-    if 'Sign in to learn more about' in soup.find('meta')['content']:
-        return None
-    elif 'Meet your next favorite book' in soup.find('title').text.strip():
-        return None
-    elif 'author/show' in soup.find('link')['href']:
+def extract_user(user_id: int, soup: BeautifulSoup) -> Optional[User]:
+    black_list_terms = {'Sign in to learn more', 'author/show', 'Meet your next favorite book'}
+    content = soup.find('meta')['content']
+    if any(term in content for term in black_list_terms):
         return None
 
-    try:
-        user_name = re.search(r'(.+)’s', soup.find('title').text.strip().replace('\n', '')).group(1)
-    except AttributeError:
-        raise AttributeError(user_id)
-    user = User(id=user_id, name=user_name)
-    return user
-
-
-def get_date_published(date_published_str: str) -> Optional[datetime]:
-    if date_published_str == 'unknown' or date_published_str.startswith('-'):
-        return None
-    elif date_published_str.isdigit():
-        return None if date_published_str == '0' else datetime(year=int(date_published_str), month=1, day=1)
-
-    date_formats = ['%b %d, %Y', '%b %Y']
-    for format_str in date_formats:
-        try:
-            return datetime.strptime(date_published_str, format_str)
-        except ValueError:
-            continue
+    user_name_match = re.search(r'(.+)’s', soup.find('title').text.strip())
+    if user_name_match:
+        return User(id=user_id, name=user_name_match.group(1))
     return None
 
 
-def get_books_info(soup: BeautifulSoup) -> Optional[list]:
-    if soup.find('div', _class='greyText nocontent stacked'):
+def get_date_published(date_str: str) -> Optional[datetime]:
+    if date_str in {'unknown', '0'} or date_str.startswith('-'):
         return None
 
-    book_info = []
+    date_formats = ['%b %d, %Y', '%b %Y', '%Y', '%y']
+    for format_str in date_formats:
+        with suppress(ValueError):
+            return datetime.strptime(date_str, format_str)
+    return None
 
+
+def extract_books(soup: BeautifulSoup) -> Optional[set[BookInfo]]:
+    if soup.find('div', class_='greyText nocontent stacked'):
+        return None
+
+    books_info = set()
     for book_element in soup.find_all('tr', class_='bookalike'):
         title_element = book_element.find('td', class_='field title').find('a')
         book_url = title_element['href']
 
-        book_url_regex = re.search(r'/book/show/(\d+)', book_url)
-        if not book_url_regex:
+        book_id_match = re.search(r'/book/show/(\d+)', book_url)
+        if not book_id_match:
             raise ValueError(book_url)
-        book_id = int(book_url_regex.group(1))
+        book_id = int(book_id_match.group(1))
 
-        author_element = book_element.find('td', class_='field author').find('a')
-
-        if not author_element:
+        try:
+            author_element = book_element.find('td', class_='field author').find('a')
+            author_id_match = re.search(r'/author/show/(\d+)', author_element['href'])
+            if not author_id_match:
+                continue
+            author_id = int(author_id_match.group(1))
+        except TypeError:
             continue
-
-        author_url_regex = re.search(r'/author/show/(\d+)', author_element['href'])
-        if not author_url_regex:
-            raise ValueError(author_element['href'])
-        author_id = int(author_url_regex.group(1))
 
         isbn = book_element.find('td', class_='field isbn').find('div').text.strip()
         isbn13 = book_element.find('td', class_='field isbn13').find('div').text.strip()
         pages_count_str = book_element.find('td', class_='field num_pages').find('div').text.strip()
-        pages_count = None if pages_count_str == 'unknown' else int(re.search(r'(\d+)', pages_count_str).group(1))
+        pages_count_match = re.search(r'(\d+)', pages_count_str)
+        pages_count = None if pages_count_str == 'unknown' else int(pages_count_match.group(1))
         avg_rating = float(book_element.find('td', class_='field avg_rating').find('div').text.strip())
         ratings_count_str = book_element.find('td', class_='field num_ratings').find('div').text
+        ratings_count = int(ratings_count_str.replace(',', '').strip())
         date_published_str = book_element.find('td', class_='field date_pub').find('div').text.strip()
-        user_rating = RATINGS.get(book_element.find('td', class_='field rating').find('span').text.strip(), 0)
+        user_rating_text = book_element.find('td', class_='field rating').find('span').text.strip()
+        user_rating = RATINGS.get(user_rating_text, 0)
 
-        book_info.append({
-            'id': book_id,
-            'cover': book_element.find('img')['src'],
-            'title': title_element['title'],
-            'book_url': book_url,
-            'author': author_element.text.strip(),
-            'author_id': author_id,
-            'author_url': author_element['href'],
-            'isbn': isbn,
-            'isbn13': isbn13,
-            'pages_count': pages_count,
-            'avg_rating': avg_rating,
-            'ratings_count': int(ratings_count_str.strip().replace(',', '')),
-            'date_published': get_date_published(date_published_str),
-            'user_rating': user_rating
-        })
+        books_info.add(BookInfo(
+            id=book_id,
+            cover_url=book_element.find('img')['src'],
+            title=title_element['title'],
+            book_url=book_url,
+            author=author_element.text.strip(),
+            author_id=author_id,
+            author_url=author_element['href'],
+            isbn=isbn,
+            isbn13=isbn13,
+            pages_count=pages_count,
+            avg_rating=avg_rating,
+            ratings_count=ratings_count,
+            date_published=get_date_published(date_published_str),
+            user_rating=user_rating
+        ))
+    return books_info
 
-    return book_info
 
-
-def get_files() -> pd.DataFrame:
-    csv_file = r'C:\Home\Work\graduate-work\book-scraper\index.csv'
-    command = f'es.exe *.html -path {HTML_DIR} -export-csv {csv_file}'
+def extract_file_list(html_dir: str, csv_tmp_file: str) -> pd.DataFrame:
+    command = f'es.exe *.html -path {html_dir} -export-csv {csv_tmp_file}'
     subprocess.run(command, check=True)
-    df = pd.read_csv(csv_file)
-    os.remove(csv_file)
+    df = pd.read_csv(csv_tmp_file)
+    os.remove(csv_tmp_file)
     return df
-
-
-def filter_files(files_df: pd.DataFrame, engine: Engine) -> pd.DataFrame:
-    file_paths_to_check = set(files_df['Filename'])
-    with sessionmaker(bind=engine)() as session:
-        worked_on_files = session.query(File.file_path).all()
-        worked_on_file_paths = {row[0] for row in worked_on_files}
-        files_to_work_on = file_paths_to_check - worked_on_file_paths
-    return pd.DataFrame({'Filename': list(files_to_work_on)})
 
 
 async def prepare_data_for_db(batch_inserts: set[Record], user_id: int, html: str, pbar: tqdm) -> None:
     soup = BeautifulSoup(html, 'lxml')
-    user = get_user(user_id, soup)
+    user = extract_user(user_id, soup)
     if not user:
         pbar.update(1)
-        return
+        return None
+
     batch_inserts.add(user)
-    try:
-        books_info = get_books_info(soup)
-    except Exception:
-        print(soup)
-        raise Exception(user_id)
+    books_info = extract_books(soup)
+
     if not books_info:
         pbar.update(1)
-        return
+        return None
+
     for book_info in books_info:
-        book = Book(id=book_info['id'], title=book_info['title'], author=book_info['author'],
-                    isbn=book_info['isbn'], isbn13=book_info['isbn13'], url=book_info['book_url'],
-                    cover_url=book_info['cover'], pages_count=book_info['pages_count'],
-                    avg_rating=book_info['avg_rating'], ratings_count=book_info['ratings_count'],
-                    date_published=book_info['date_published'])
-        rating = Rating(user_id=user_id, book_id=book_info['id'], user_rating=book_info['user_rating'])
-        author = Author(id=book_info['author_id'], name=book_info['author'], url=book_info['author_url'])
+        book = Book(id=book_info.id, title=book_info.title, author=book_info.author,
+                    isbn=book_info.isbn, isbn13=book_info.isbn13, url=book_info.book_url,
+                    cover_url=book_info.cover_url, pages_count=book_info.pages_count,
+                    avg_rating=book_info.avg_rating, ratings_count=book_info.ratings_count,
+                    date_published=book_info.date_published)
+        rating = Rating(user_id=user_id, book_id=book_info.id, user_rating=book_info.user_rating)
+        author = Author(id=book_info.author_id, name=book_info.author, url=book_info.author_url)
         batch_inserts.add(book)
         batch_inserts.add(rating)
         batch_inserts.add(author)
@@ -188,26 +201,41 @@ async def get_inserts(html_file_contents: set[tuple[int, str]], pbar: tqdm) -> s
     return batch_inserts
 
 
+async def remove_files(batch_files: tuple[str]):
+    tasks = {aiofiles.os.remove(file_path) for file_path in batch_files}
+    await asyncio.gather(*tasks)
+
+
+def merge_records_to_db(batch_inserts: set[Record], engine: Engine):
+    pbar = tqdm(total=len(batch_inserts), position=1, leave=False)
+    session = sessionmaker(bind=engine)()
+    with session, pbar:
+        for model_cls in [User, Author, Book, Rating]:
+            for record in filter(lambda r: isinstance(r, model_cls), batch_inserts):
+                session.merge(record)
+                pbar.update(1)
+        session.commit()
+
+
 async def main() -> None:
-    engine = create_engine(f'sqlite:///{DB_FILE}', echo=False)
-    Base.metadata.create_all(engine)
+    args = get_args()
+    html_dir = args.folder
+    chunk_size = args.chunk_size
+    project_folder = dirname(dirname(abspath(__file__)))
+    csv_tmp_file = join(project_folder, 'tmp.csv')
+    db_file = join(project_folder, 'goodreads.db')
 
-    files_df = get_files()
-    print(len(files_df))
-    files_df = filter_files(files_df, engine)
-    print(len(files_df))
+    files_df = extract_file_list(html_dir, csv_tmp_file)
 
-    with tqdm(total=len(files_df), position=0, smoothing=0) as pbar:
+    engine = create_engine(f'sqlite:///{db_file}', echo=False)
+    with tqdm(total=len(files_df), position=0) as pbar:
         batch_files: tuple[str]
-        for batch_files in batched(files_df['Filename'], 2048):
+        for batch_files in batched(files_df['Filename'], chunk_size):
             html_file_contents = await get_file_contents(batch_files)
             batch_inserts = await get_inserts(html_file_contents, pbar)
-            batch_inserts = batch_inserts.union({File(file_path=_file) for _file in batch_files})
-            with sessionmaker(bind=engine)() as session:
-                record: Record
-                for record in tqdm(batch_inserts, position=1, leave=False, smoothing=0):
-                    session.merge(record)
-                session.commit()
+
+            await remove_files(batch_files)
+            merge_records_to_db(batch_inserts, engine)
 
 
 if __name__ == '__main__':

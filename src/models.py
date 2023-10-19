@@ -94,21 +94,3 @@ class Book(Base):
                 f'cover_url={self.cover_url}, pages_count={self.pages_count},'
                 f'avg_rating={self.avg_rating}, ratings_count={self.ratings_count},'
                 f'date_published={self.date_published})>')
-
-
-class File(Base):
-    __tablename__ = 'File'
-
-    id = Column(Integer, autoincrement=True, primary_key=True, nullable=False)
-    file_path = Column(String(100), nullable=False, unique=True)
-
-    def __eq__(self, other):
-        if isinstance(other, File):
-            return self.file_path == other.file_path
-        return False
-
-    def __hash__(self):
-        return hash(self.file_path)
-
-    def __repr__(self):
-        return f'<File(id={self.id}, file_path={self.file_path})>'
